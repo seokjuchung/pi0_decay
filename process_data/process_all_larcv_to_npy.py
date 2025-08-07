@@ -7,8 +7,8 @@ SOFTWARE_DIR = '/nevis/houston/home/sc5303/anomaly/offline_anomaly/spine'
 sys.path.insert(0, SOFTWARE_DIR)
 from spine.driver import Driver
 
-DATA_DIR = '/nevis/riverside/data/sc5303/sbnd/offline_ad/pi0/'
-OUTPUT_DIR = DATA_DIR  # Save NPY files to the same directory
+DATA_DIR = '/nevis/riverside/data/sc5303/sbnd/offline_ad/pi0/larcv'
+OUTPUT_DIR = '/nevis/riverside/data/sc5303/sbnd/offline_ad/pi0/npy'
 
 # Get all LArCV files
 larcv_files = sorted(glob.glob(os.path.join(DATA_DIR, 'larcv*.root')))
@@ -27,12 +27,16 @@ io:
       file_keys: [FILE_PATH]
       limit_num_files: 1
       schema:
-        input_data:
-          parser: sparse3d
-          sparse_event: sparse3d_pcluster
         seg_label:
           parser: sparse3d
           sparse_event: sparse3d_pcluster_semantics
+        clust_label:
+          parser: cluster3d
+          cluster_event: cluster3d_pcluster
+          particle_event: particle_corrected
+          sparse_semantics_event: sparse3d_pcluster_semantics
+          add_particle_info: true
+          clean_data: true
         meta:
           parser: meta
           sparse_event: sparse3d_pcluster
@@ -41,7 +45,7 @@ io:
           sparse_event: sparse3d_pcluster
 """
 
-from spine.utils.globals import SHAPE_COL, VALUE_COL, GHOST_SHP
+from spine.utils.globals import SHAPE_COL, GHOST_SHP
 
 # Process each file individually
 for file_idx, larcv_file in enumerate(larcv_files):
@@ -59,8 +63,8 @@ for file_idx, larcv_file in enumerate(larcv_files):
         # Collect all input data from all entries
         all_data = []
         
-        for entry in range(len(data['input_data'])):
-            input_data = data['input_data'][entry]
+        for entry in range(len(data['clust_label'])):
+            input_data = data['clust_label'][entry]
             seg_label = data['seg_label'][entry][:, SHAPE_COL]
             nonghost_mask = seg_label < GHOST_SHP
             
