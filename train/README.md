@@ -12,6 +12,7 @@ This directory contains all the scripts needed to train and analyze the CNN auto
 - `setup_training.sh` - Setup environment and check dependencies
 - `quick_train.sh` - Interactive training with preset configurations
 - `run_full_training.sh` - Batch script for full dataset training
+- `safe_train.sh` - Safe training with CUDA error handling and CPU fallback
 
 ## Quick Start
 
@@ -20,12 +21,17 @@ This directory contains all the scripts needed to train and analyze the CNN auto
    ./setup_training.sh
    ```
 
-2. **Run interactive training:**
+2. **Run safe training (recommended for CUDA issues):**
+   ```bash
+   ./safe_train.sh
+   ```
+
+3. **Run interactive training:**
    ```bash
    ./quick_train.sh
    ```
 
-3. **Or run specific configuration:**
+4. **Or run specific configuration:**
    ```bash
    # Quick test (5 files, 20 epochs)
    python train_cnn_autoencoder.py --max_files 5 --num_epochs 20 --save_plots

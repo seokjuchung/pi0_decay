@@ -53,20 +53,69 @@ parser.add_argument('--num_workers', type=int, default=4,
                     help='Number of data loader workers')
 parser.add_argument('--save_plots', action='store_true',
                     help='Save training plots')
+parser.add_argument('--debug', action='store_true',
+                    help='Enable debug mode with additional checks')
+parser.add_argument('--memory_fraction', type=float, default=0.8,
+                    help='CUDA memory fraction to use (default: 0.8)')
+parser.add_argument('--multi_gpu', action='store_true',
+                    help='Use all available GPUs with DataParallel')
+parser.add_argument('--gpu_ids', type=str, default=None,
+                    help='Comma-separated list of GPU IDs to use (e.g., "0,1,2,3")')
 
-def setup_device(device_arg):
-    """Setup compute device"""
+def setup_device(device_arg, memory_fraction=0.8, debug_mode=False, multi_gpu=False, gpu_ids=None):
+    """Setup compute device with multi-GPU support"""
     if device_arg == 'auto':
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     else:
         device = torch.device(device_arg)
     
     print(f"Using device: {device}")
-    if device.type == 'cuda':
-        print(f"GPU: {torch.cuda.get_device_name(0)}")
-        print(f"Memory: {torch.cuda.get_device_properties(0).total_memory // 1024**3} GB")
     
-    return device
+    if device.type == 'cuda':
+        # Get GPU information
+        num_gpus = torch.cuda.device_count()
+        print(f"Found {num_gpus} CUDA devices")
+        
+        # Parse GPU IDs if provided
+        if gpu_ids is not None:
+            gpu_list = [int(x.strip()) for x in gpu_ids.split(',')]
+            print(f"Using specified GPU IDs: {gpu_list}")
+        else:
+            gpu_list = list(range(num_gpus))
+            print(f"Using all available GPU IDs: {gpu_list}")
+        
+        # Set visible devices
+        if gpu_ids is not None:
+            os.environ['CUDA_VISIBLE_DEVICES'] = gpu_ids
+        
+        for i, gpu_id in enumerate(gpu_list):
+            if gpu_id < num_gpus:
+                print(f"GPU {gpu_id}: {torch.cuda.get_device_name(gpu_id)}")
+                print(f"  Memory: {torch.cuda.get_device_properties(gpu_id).total_memory // 1024**3} GB")
+        
+        # Clear any existing CUDA cache on all devices
+        for gpu_id in gpu_list:
+            if gpu_id < num_gpus:
+                torch.cuda.set_device(gpu_id)
+                torch.cuda.empty_cache()
+        
+        # Set memory fraction on all devices
+        for gpu_id in gpu_list:
+            if gpu_id < num_gpus:
+                torch.cuda.set_device(gpu_id)
+                torch.cuda.set_per_process_memory_fraction(memory_fraction, gpu_id)
+        
+        if debug_mode:
+            # Enable debug mode for CUDA errors
+            os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
+            print(f"CUDA debug mode enabled")
+        
+        print(f"CUDA memory cleared on all devices, using {memory_fraction*100}% of GPU memory")
+        
+        # Return to device 0
+        torch.cuda.set_device(0)
+    
+    return device, gpu_list if device.type == 'cuda' else None
 
 def setup_reproducibility():
     """Set random seeds for reproducibility"""
@@ -85,6 +134,13 @@ def load_npy_file(file_path, config):
             print(f"  Warning: Expected 5 columns, got {data.shape[1]}")
             return []
         
+        # Check for NaN or infinite values
+        if np.any(np.isnan(data)) or np.any(np.isinf(data)):
+            print(f"  Warning: Found NaN or infinite values in {file_path}")
+            # Remove rows with NaN or infinite values
+            data = data[np.isfinite(data).all(axis=1)]
+            print(f"  Cleaned data shape: {data.shape}")
+        
         # Group by event
         df = pd.DataFrame(data, columns=['event', 'x', 'y', 'z', 'energy'])
         events = []
@@ -92,12 +148,23 @@ def load_npy_file(file_path, config):
         for event_id in df['event'].unique():
             event_data = df[df['event'] == event_id][['x', 'y', 'z', 'energy']].values
             
+            # Check for valid data
+            if len(event_data) == 0:
+                continue
+                
+            # Check for NaN or infinite values in event
+            if np.any(np.isnan(event_data)) or np.any(np.isinf(event_data)):
+                continue
+            
             # Filter by size
             if config['min_points'] <= len(event_data) <= config['max_points']:
                 # Sort by energy (highest to lowest) - creates structure for CNN
                 sorted_indices = np.argsort(-event_data[:, 3])
                 sorted_event = event_data[sorted_indices]
-                events.append(sorted_event)
+                
+                # Final check for data validity
+                if np.all(np.isfinite(sorted_event)):
+                    events.append(sorted_event)
         
         print(f"  Loaded {len(events)} valid events")
         return events
@@ -321,6 +388,15 @@ def masked_mse_loss(output, target, mask=None):
     if mask is None:
         return F.mse_loss(output, target)
     
+    # Check for NaN or infinite values
+    if torch.any(torch.isnan(output)) or torch.any(torch.isinf(output)):
+        print("Warning: NaN or inf detected in output")
+        return torch.tensor(0.0, device=output.device, requires_grad=True)
+    
+    if torch.any(torch.isnan(target)) or torch.any(torch.isinf(target)):
+        print("Warning: NaN or inf detected in target")
+        return torch.tensor(0.0, device=output.device, requires_grad=True)
+    
     # Expand mask to match feature dimensions
     mask = mask.unsqueeze(-1)
     
@@ -331,8 +407,13 @@ def masked_mse_loss(output, target, mask=None):
     # Calculate loss only on non-padded positions
     loss = F.mse_loss(masked_output, masked_target, reduction='none')
     
+    # Check if mask has valid positions
+    valid_positions = mask.sum()
+    if valid_positions == 0:
+        return torch.tensor(0.0, device=output.device, requires_grad=True)
+    
     # Sum over features and sequence, then average over valid positions
-    loss = loss.sum() / mask.sum().float()
+    loss = loss.sum() / valid_positions.float()
     
     return loss
 
@@ -344,31 +425,61 @@ def train_epoch(model, dataloader, optimizer, device):
     
     progress_bar = tqdm(dataloader, desc="Training")
     
-    for batch in progress_bar:
-        batch = batch.to(device)
-        optimizer.zero_grad()
-        
-        # Create mask for padded positions
-        mask = create_padding_mask(batch)
-        
-        # Forward pass
-        reconstructed = model(batch, mask=mask)
-        
-        # Calculate loss
-        loss = masked_mse_loss(reconstructed, batch, mask)
-        
-        # Backward pass
-        loss.backward()
-        
-        # Gradient clipping
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        
-        optimizer.step()
-        
-        total_loss += loss.item()
-        num_batches += 1
-        
-        progress_bar.set_postfix({'Loss': f'{loss.item():.6f}'})
+    for batch_idx, batch in enumerate(progress_bar):
+        try:
+            batch = batch.to(device)
+            
+            # Check for invalid data
+            if torch.any(torch.isnan(batch)) or torch.any(torch.isinf(batch)):
+                print(f"Warning: Invalid data in batch {batch_idx}, skipping...")
+                continue
+            
+            optimizer.zero_grad()
+            
+            # Create mask for padded positions
+            mask = create_padding_mask(batch)
+            
+            # Forward pass
+            reconstructed = model(batch, mask=mask)
+            
+            # Calculate loss
+            loss = masked_mse_loss(reconstructed, batch, mask)
+            
+            # Check if loss is valid
+            if torch.isnan(loss) or torch.isinf(loss):
+                print(f"Warning: Invalid loss in batch {batch_idx}, skipping...")
+                continue
+            
+            # Backward pass
+            loss.backward()
+            
+            # Gradient clipping
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
+            optimizer.step()
+            
+            total_loss += loss.item()
+            num_batches += 1
+            
+            progress_bar.set_postfix({'Loss': f'{loss.item():.6f}'})
+            
+            # Clear CUDA cache periodically
+            if device.type == 'cuda' and batch_idx % 10 == 0:
+                torch.cuda.empty_cache()
+            
+        except RuntimeError as e:
+            if "CUDA" in str(e):
+                print(f"CUDA error in batch {batch_idx}: {e}")
+                if device.type == 'cuda':
+                    torch.cuda.empty_cache()
+                # Skip this batch and continue
+                continue
+            else:
+                raise e
+    
+    if num_batches == 0:
+        print("Warning: No valid batches processed!")
+        return 0.0
     
     return total_loss / num_batches
 
@@ -379,20 +490,48 @@ def validate_epoch(model, dataloader, device):
     num_batches = 0
     
     with torch.no_grad():
-        for batch in tqdm(dataloader, desc="Validation"):
-            batch = batch.to(device)
-            
-            # Create mask
-            mask = create_padding_mask(batch)
-            
-            # Forward pass
-            reconstructed = model(batch, mask=mask)
-            
-            # Calculate loss
-            loss = masked_mse_loss(reconstructed, batch, mask)
-            
-            total_loss += loss.item()
-            num_batches += 1
+        for batch_idx, batch in enumerate(tqdm(dataloader, desc="Validation")):
+            try:
+                batch = batch.to(device)
+                
+                # Check for invalid data
+                if torch.any(torch.isnan(batch)) or torch.any(torch.isinf(batch)):
+                    print(f"Warning: Invalid data in validation batch {batch_idx}, skipping...")
+                    continue
+                
+                # Create mask
+                mask = create_padding_mask(batch)
+                
+                # Forward pass
+                reconstructed = model(batch, mask=mask)
+                
+                # Calculate loss
+                loss = masked_mse_loss(reconstructed, batch, mask)
+                
+                # Check if loss is valid
+                if torch.isnan(loss) or torch.isinf(loss):
+                    print(f"Warning: Invalid loss in validation batch {batch_idx}, skipping...")
+                    continue
+                
+                total_loss += loss.item()
+                num_batches += 1
+                
+                # Clear CUDA cache periodically
+                if device.type == 'cuda' and batch_idx % 10 == 0:
+                    torch.cuda.empty_cache()
+                    
+            except RuntimeError as e:
+                if "CUDA" in str(e):
+                    print(f"CUDA error in validation batch {batch_idx}: {e}")
+                    if device.type == 'cuda':
+                        torch.cuda.empty_cache()
+                    continue
+                else:
+                    raise e
+    
+    if num_batches == 0:
+        print("Warning: No valid validation batches processed!")
+        return float('inf')
     
     return total_loss / num_batches
 
@@ -472,7 +611,7 @@ def main():
     
     # Setup
     setup_reproducibility()
-    device = setup_device(args.device)
+    device, gpu_list = setup_device(args.device, args.memory_fraction, args.debug, args.multi_gpu, args.gpu_ids)
     
     # Configuration
     config = {
@@ -583,7 +722,20 @@ def main():
         input_dim=config['feature_dim'],
         latent_dim=config['latent_dim'],
         max_seq_length=config['max_points']
-    ).to(device)
+    )
+    
+    # Setup multi-GPU training
+    if device.type == 'cuda' and (args.multi_gpu or torch.cuda.device_count() > 1):
+        if torch.cuda.device_count() > 1:
+            print(f"Using {torch.cuda.device_count()} GPUs with DataParallel")
+            model = nn.DataParallel(model)
+            # Adjust batch size for multi-GPU
+            effective_batch_size = config['batch_size'] * torch.cuda.device_count()
+            print(f"Effective batch size across all GPUs: {effective_batch_size}")
+        else:
+            print("Multi-GPU requested but only 1 GPU available")
+    
+    model = model.to(device)
     
     # Count parameters
     total_params = sum(p.numel() for p in model.parameters())
@@ -597,7 +749,7 @@ def main():
     # Training setup
     optimizer = optim.Adam(model.parameters(), lr=config['learning_rate'], weight_decay=1e-5)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.7, patience=5, verbose=True
+        optimizer, mode='min', factor=0.7, patience=5
     )
     
     # Training loop
@@ -623,7 +775,13 @@ def main():
         val_losses.append(val_loss)
         
         # Learning rate scheduling
+        old_lr = optimizer.param_groups[0]['lr']
         scheduler.step(val_loss)
+        new_lr = optimizer.param_groups[0]['lr']
+        
+        # Print learning rate changes
+        if new_lr != old_lr:
+            print(f"Learning rate reduced from {old_lr:.2e} to {new_lr:.2e}")
         
         # Print results
         current_lr = optimizer.param_groups[0]['lr']
@@ -635,16 +793,18 @@ def main():
             patience_counter = 0
             
             # Save best model
+            model_state = model.module.state_dict() if hasattr(model, 'module') else model.state_dict()
             torch.save({
                 'epoch': epoch,
-                'model_state_dict': model.state_dict(),
+                'model_state_dict': model_state,
                 'optimizer_state_dict': optimizer.state_dict(),
                 'train_loss': train_loss,
                 'val_loss': val_loss,
                 'config': config,
                 'scaler': train_dataset.scaler,
                 'train_losses': train_losses,
-                'val_losses': val_losses
+                'val_losses': val_losses,
+                'multi_gpu': hasattr(model, 'module')
             }, os.path.join(args.output_dir, 'best_cnn_autoencoder.pth'))
             
             print(f"New best model saved! Val Loss: {val_loss:.6f}")
@@ -673,7 +833,12 @@ def main():
     # Load best model for evaluation
     print("\nLoading best model for final evaluation...")
     checkpoint = torch.load(os.path.join(args.output_dir, 'best_cnn_autoencoder.pth'))
-    model.load_state_dict(checkpoint['model_state_dict'])
+    
+    # Handle DataParallel model loading
+    if hasattr(model, 'module'):
+        model.module.load_state_dict(checkpoint['model_state_dict'])
+    else:
+        model.load_state_dict(checkpoint['model_state_dict'])
     
     # Final evaluation on test set
     print("Evaluating on test set...")
@@ -687,8 +852,9 @@ def main():
     print(f"Max reconstruction loss: {test_losses.max():.6f}")
     
     # Save final model and results
+    final_model_state = model.module.state_dict() if hasattr(model, 'module') else model.state_dict()
     final_results = {
-        'model_state_dict': model.state_dict(),
+        'model_state_dict': final_model_state,
         'config': config,
         'scaler': train_dataset.scaler,
         'train_losses': train_losses,
@@ -703,7 +869,9 @@ def main():
         },
         'training_time': total_training_time,
         'total_params': total_params,
-        'anomaly_threshold_95': float(np.percentile(test_losses, 95))
+        'anomaly_threshold_95': float(np.percentile(test_losses, 95)),
+        'multi_gpu': hasattr(model, 'module'),
+        'gpu_count': torch.cuda.device_count() if device.type == 'cuda' else 0
     }
     
     torch.save(final_results, os.path.join(args.output_dir, 'final_cnn_autoencoder.pth'))
